@@ -1,18 +1,17 @@
 package storage
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"time"
 
-	"context"
-
-	"github.com/CoolBanHub/aggo/memory"
+	"github.com/CoolBanHub/aggo/memory/builtin"
 	"gorm.io/gorm"
 )
 
 // UpsertUserMemory 创建或更新用户记忆（每个用户一条记录）
-func (s *SQLStore) UpsertUserMemory(ctx context.Context, userMemory *memory.UserMemory) error {
+func (s *SQLStore) UpsertUserMemory(ctx context.Context, userMemory *builtin.UserMemory) error {
 	if userMemory == nil {
 		return errors.New("记忆对象不能为空")
 	}
@@ -45,7 +44,7 @@ func (s *SQLStore) UpsertUserMemory(ctx context.Context, userMemory *memory.User
 }
 
 // GetUserMemory 获取用户的记忆
-func (s *SQLStore) GetUserMemory(ctx context.Context, userID string) (*memory.UserMemory, error) {
+func (s *SQLStore) GetUserMemory(ctx context.Context, userID string) (*builtin.UserMemory, error) {
 	if userID == "" {
 		return nil, errors.New("用户ID不能为空")
 	}

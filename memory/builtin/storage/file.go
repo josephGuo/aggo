@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/CoolBanHub/aggo/memory"
+	"github.com/CoolBanHub/aggo/memory/builtin"
 )
 
 // FileStore 基于文件的记忆存储实现
@@ -62,13 +62,13 @@ func (f *FileStore) load() error {
 
 	// 1. 加载用户记忆 (JSONL 格式，每用户一条记录)
 	if data, err := os.ReadFile(f.getFilePath("user_memories")); err == nil {
-		userMemories := make(map[string]*memory.UserMemory)
+		userMemories := make(map[string]*builtin.UserMemory)
 		lines := strings.Split(string(data), "\n")
 		for _, line := range lines {
 			if strings.TrimSpace(line) == "" {
 				continue
 			}
-			var mem memory.UserMemory
+			var mem builtin.UserMemory
 			if err := json.Unmarshal([]byte(line), &mem); err == nil {
 				userMemories[mem.UserID] = &mem
 			}
@@ -80,13 +80,13 @@ func (f *FileStore) load() error {
 
 	// 2. 加载会话摘要 (JSONL 格式)
 	if data, err := os.ReadFile(f.getFilePath("session_summaries")); err == nil {
-		sessionSummaries := make(map[string]*memory.SessionSummary)
+		sessionSummaries := make(map[string]*builtin.SessionSummary)
 		lines := strings.Split(string(data), "\n")
 		for _, line := range lines {
 			if strings.TrimSpace(line) == "" {
 				continue
 			}
-			var summary memory.SessionSummary
+			var summary builtin.SessionSummary
 			if err := json.Unmarshal([]byte(line), &summary); err == nil {
 				key := f.generateKey(summary.SessionID, summary.UserID)
 				sessionSummaries[key] = &summary // 遇到同名的会被后续行覆盖（符合更新逻辑）
@@ -99,13 +99,13 @@ func (f *FileStore) load() error {
 
 	// 3. 加载对话消息 (JSONL 格式)
 	if data, err := os.ReadFile(f.getFilePath("messages")); err == nil {
-		messages := make(map[string][]*memory.ConversationMessage)
+		messages := make(map[string][]*builtin.ConversationMessage)
 		lines := strings.Split(string(data), "\n")
 		for _, line := range lines {
 			if strings.TrimSpace(line) == "" {
 				continue
 			}
-			var msg memory.ConversationMessage
+			var msg builtin.ConversationMessage
 			if err := json.Unmarshal([]byte(line), &msg); err == nil {
 				key := f.generateKey(msg.SessionID, msg.UserID)
 				messages[key] = append(messages[key], &msg)
@@ -151,7 +151,7 @@ func (f *FileStore) saveUserMemories() error {
 }
 
 // appendUserMemory 增量追加用户记忆到 JSONL 文件
-func (f *FileStore) appendUserMemory(mem *memory.UserMemory) error {
+func (f *FileStore) appendUserMemory(mem *builtin.UserMemory) error {
 	b, err := json.Marshal(mem)
 	if err != nil {
 		return err
@@ -194,7 +194,7 @@ func (f *FileStore) saveSessionSummaries() error {
 }
 
 // appendSessionSummary 增量追加单条会话摘要到 JSONL 文件结尾
-func (f *FileStore) appendSessionSummary(summary *memory.SessionSummary) error {
+func (f *FileStore) appendSessionSummary(summary *builtin.SessionSummary) error {
 	b, err := json.Marshal(summary)
 	if err != nil {
 		return err
@@ -240,7 +240,7 @@ func (f *FileStore) saveMessages() error {
 }
 
 // appendMessage 增量追加单条对话消息到 JSONL 文件结尾
-func (f *FileStore) appendMessage(msg *memory.ConversationMessage) error {
+func (f *FileStore) appendMessage(msg *builtin.ConversationMessage) error {
 	b, err := json.Marshal(msg)
 	if err != nil {
 		return err
@@ -266,7 +266,7 @@ func (f *FileStore) appendMessage(msg *memory.ConversationMessage) error {
 
 // UpsertUserMemory 创建或更新用户记忆
 // 由于每个用户只有一条记录，直接全量重写文件（记录数极少，开销可忽略）
-func (f *FileStore) UpsertUserMemory(ctx context.Context, userMemory *memory.UserMemory) error {
+func (f *FileStore) UpsertUserMemory(ctx context.Context, userMemory *builtin.UserMemory) error {
 	if err := f.MemoryStore.UpsertUserMemory(ctx, userMemory); err != nil {
 		return err
 	}
@@ -281,14 +281,14 @@ func (f *FileStore) ClearUserMemory(ctx context.Context, userID string) error {
 	return f.saveUserMemories()
 }
 
-func (f *FileStore) SaveSessionSummary(ctx context.Context, summary *memory.SessionSummary) error {
+func (f *FileStore) SaveSessionSummary(ctx context.Context, summary *builtin.SessionSummary) error {
 	if err := f.MemoryStore.SaveSessionSummary(ctx, summary); err != nil {
 		return err
 	}
 	return f.appendSessionSummary(summary)
 }
 
-func (f *FileStore) UpdateSessionSummary(ctx context.Context, summary *memory.SessionSummary) error {
+func (f *FileStore) UpdateSessionSummary(ctx context.Context, summary *builtin.SessionSummary) error {
 	if err := f.MemoryStore.UpdateSessionSummary(ctx, summary); err != nil {
 		return err
 	}
@@ -302,7 +302,7 @@ func (f *FileStore) DeleteSessionSummary(ctx context.Context, sessionID string, 
 	return f.saveSessionSummaries()
 }
 
-func (f *FileStore) SaveMessage(ctx context.Context, message *memory.ConversationMessage) error {
+func (f *FileStore) SaveMessage(ctx context.Context, message *builtin.ConversationMessage) error {
 	if err := f.MemoryStore.SaveMessage(ctx, message); err != nil {
 		return err
 	}

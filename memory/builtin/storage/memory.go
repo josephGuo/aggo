@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/CoolBanHub/aggo/memory"
+	"github.com/CoolBanHub/aggo/memory/builtin"
 	"github.com/CoolBanHub/aggo/utils"
 	"github.com/gookit/slog"
 )
@@ -21,21 +21,21 @@ type MemoryStore struct {
 	mu sync.RWMutex
 
 	// 用户记忆存储 map[userID]*UserMemory
-	userMemories map[string]*memory.UserMemory
+	userMemories map[string]*builtin.UserMemory
 
 	// 会话摘要存储 map[sessionID+userID]*SessionSummary
-	sessionSummaries map[string]*memory.SessionSummary
+	sessionSummaries map[string]*builtin.SessionSummary
 
 	// 对话消息存储 map[sessionID+userID][]*ConversationMessage
-	messages map[string][]*memory.ConversationMessage
+	messages map[string][]*builtin.ConversationMessage
 }
 
 // NewMemoryStore 创建新的内存存储实例
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
-		userMemories:     make(map[string]*memory.UserMemory),
-		sessionSummaries: make(map[string]*memory.SessionSummary),
-		messages:         make(map[string][]*memory.ConversationMessage),
+		userMemories:     make(map[string]*builtin.UserMemory),
+		sessionSummaries: make(map[string]*builtin.SessionSummary),
+		messages:         make(map[string][]*builtin.ConversationMessage),
 	}
 }
 
@@ -52,7 +52,7 @@ func (m *MemoryStore) generateKey(sessionID, userID string) string {
 }
 
 // UpsertUserMemory 创建或更新用户记忆（每个用户一条记录）
-func (m *MemoryStore) UpsertUserMemory(ctx context.Context, userMemory *memory.UserMemory) error {
+func (m *MemoryStore) UpsertUserMemory(ctx context.Context, userMemory *builtin.UserMemory) error {
 	if userMemory == nil {
 		return errors.New("记忆对象不能为空")
 	}
@@ -79,7 +79,7 @@ func (m *MemoryStore) UpsertUserMemory(ctx context.Context, userMemory *memory.U
 }
 
 // GetUserMemory 获取用户的记忆
-func (m *MemoryStore) GetUserMemory(ctx context.Context, userID string) (*memory.UserMemory, error) {
+func (m *MemoryStore) GetUserMemory(ctx context.Context, userID string) (*builtin.UserMemory, error) {
 	if userID == "" {
 		return nil, errors.New("用户ID不能为空")
 	}
@@ -109,7 +109,7 @@ func (m *MemoryStore) ClearUserMemory(ctx context.Context, userID string) error 
 }
 
 // SaveSessionSummary 保存会话摘要
-func (m *MemoryStore) SaveSessionSummary(ctx context.Context, summary *memory.SessionSummary) error {
+func (m *MemoryStore) SaveSessionSummary(ctx context.Context, summary *builtin.SessionSummary) error {
 	if summary == nil {
 		return errors.New("摘要对象不能为空")
 	}
@@ -136,7 +136,7 @@ func (m *MemoryStore) SaveSessionSummary(ctx context.Context, summary *memory.Se
 }
 
 // GetSessionSummary 获取会话摘要
-func (m *MemoryStore) GetSessionSummary(ctx context.Context, sessionID string, userID string) (*memory.SessionSummary, error) {
+func (m *MemoryStore) GetSessionSummary(ctx context.Context, sessionID string, userID string) (*builtin.SessionSummary, error) {
 	if sessionID == "" {
 		return nil, errors.New("会话ID不能为空")
 	}
@@ -157,7 +157,7 @@ func (m *MemoryStore) GetSessionSummary(ctx context.Context, sessionID string, u
 }
 
 // UpdateSessionSummary 更新会话摘要
-func (m *MemoryStore) UpdateSessionSummary(ctx context.Context, summary *memory.SessionSummary) error {
+func (m *MemoryStore) UpdateSessionSummary(ctx context.Context, summary *builtin.SessionSummary) error {
 	if summary == nil {
 		return errors.New("摘要对象不能为空")
 	}
@@ -205,7 +205,7 @@ func (m *MemoryStore) DeleteSessionSummary(ctx context.Context, sessionID string
 }
 
 // SaveMessage 保存对话消息
-func (m *MemoryStore) SaveMessage(ctx context.Context, message *memory.ConversationMessage) error {
+func (m *MemoryStore) SaveMessage(ctx context.Context, message *builtin.ConversationMessage) error {
 	if message == nil {
 		return errors.New("消息对象不能为空")
 	}
@@ -235,7 +235,7 @@ func (m *MemoryStore) SaveMessage(ctx context.Context, message *memory.Conversat
 }
 
 // GetMessages 获取会话的消息历史
-func (m *MemoryStore) GetMessages(ctx context.Context, sessionID string, userID string, limit int) ([]*memory.ConversationMessage, error) {
+func (m *MemoryStore) GetMessages(ctx context.Context, sessionID string, userID string, limit int) ([]*builtin.ConversationMessage, error) {
 	if sessionID == "" {
 		return nil, errors.New("会话ID不能为空")
 	}
@@ -249,10 +249,10 @@ func (m *MemoryStore) GetMessages(ctx context.Context, sessionID string, userID 
 	key := m.generateKey(sessionID, userID)
 	msgs, exists := m.messages[key]
 	if !exists {
-		return []*memory.ConversationMessage{}, nil
+		return []*builtin.ConversationMessage{}, nil
 	}
 
-	messages := make([]*memory.ConversationMessage, len(msgs))
+	messages := make([]*builtin.ConversationMessage, len(msgs))
 	copy(messages, msgs)
 
 	// 按时间排序（最新的在后面）
@@ -313,7 +313,7 @@ func (m *MemoryStore) CleanupOldMessages(ctx context.Context, userID string, bef
 		}
 
 		// 过滤掉旧消息
-		var validMessages []*memory.ConversationMessage
+		var validMessages []*builtin.ConversationMessage
 		for _, msg := range messages {
 			if msg.CreatedAt.After(before) {
 				validMessages = append(validMessages, msg)

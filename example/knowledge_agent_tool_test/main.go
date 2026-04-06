@@ -10,11 +10,13 @@ import (
 	"github.com/CoolBanHub/aggo/database/milvus"
 	postgres2 "github.com/CoolBanHub/aggo/database/postgres"
 	"github.com/CoolBanHub/aggo/memory"
-	storage2 "github.com/CoolBanHub/aggo/memory/storage"
+	"github.com/CoolBanHub/aggo/memory/builtin"
+	storage2 "github.com/CoolBanHub/aggo/memory/builtin/storage"
 	"github.com/CoolBanHub/aggo/model"
 	"github.com/CoolBanHub/aggo/tools"
 	"github.com/CoolBanHub/aggo/utils"
 	"github.com/cloudwego/eino-ext/components/document/transformer/splitter/recursive"
+	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/components/embedding"
 	"github.com/cloudwego/eino/components/retriever"
 	"github.com/cloudwego/eino/flow/retriever/router"
@@ -49,13 +51,7 @@ func main() {
 		return
 	}
 
-	//gormSql, err := NewPostgresGorm("host=localhost user=postgres password=postgres dbname=aggo port=5432 sslmode=disable", logger.Silent)
-	//if err != nil {
-	//	log.Fatalf("创建gorm失败: %v", err)
-	//	return
-	//}
-	//databaseDB := getPostgresDB(gormSql, em)
-	databaseDB := getMilvusDB(em)
+	databaseDB := getMilvusDB(ctx, em)
 
 	log.Println("开始添加数据")
 
@@ -90,7 +86,6 @@ func main() {
 		},
 	}
 
-	//将文档转换为分块
 	chunkDocs, err := recursive.NewSplitter(ctx, &recursive.Config{
 		ChunkSize:   1024,
 		OverlapSize: 200,
@@ -117,24 +112,25 @@ func main() {
 		log.Println("知识库初始化完成，已加载示例文档")
 		return
 	}
-	//s, err := storage2.NewGormStorage(gormSql)
-	//if err != nil {
-	//	log.Fatalf("new sql store fail,err:%s", err)
-	//	return
-	//}
+
 	s := storage2.NewMemoryStore()
 
-	memoryManager, err := memory.NewMemoryManager(cm, s, &memory.MemoryConfig{
-		EnableSessionSummary: false,
-		EnableUserMemories:   false,
-		MemoryLimit:          8,
-		Retrieval:            memory.RetrievalLastN,
+	provider, err := memory.GlobalRegistry().CreateProvider("builtin", &builtin.ProviderConfig{
+		ChatModel: cm,
+		Storage:   s,
+		MemoryConfig: &builtin.MemoryConfig{
+			EnableSessionSummary: false,
+			EnableUserMemories:   false,
+			MemoryLimit:          8,
+			Retrieval:            builtin.RetrievalLastN,
+		},
 	})
 	if err != nil {
-		log.Fatalf("new manager fail,err:%s", err)
+		log.Fatalf("new provider fail,err:%s", err)
 		return
 	}
-	defer memoryManager.Close()
+	defer provider.Close()
+
 	routerRetriever, err := router.NewRetriever(ctx, &router.Config{
 		Retrievers: map[string]retriever.Retriever{
 			"vector": databaseDB,
@@ -153,20 +149,25 @@ func main() {
 	if err != nil {
 		return
 	}
-	// 5. 创建主 Agent，将 KnowledgeAgent 作为工具
-	mainAgent, err := agent.NewAgent(ctx, cm,
-		agent.WithMemoryManager(memoryManager),
-		agent.WithTools(tools.GetKnowledgeTools(databaseDB, routerRetriever, &retriever.Options{
-			TopK:           utils.ValueToPtr(10),
-			ScoreThreshold: utils.ValueToPtr(0.2),
-		})),
-		agent.WithSystemPrompt("你是一个技术专家助手。当用户询问技术问题时，你应该使用 knowledge_reason 工具来搜索和分析相关信息，然后提供准确的回答。"))
 
+	// 5. 创建主 Agent
+	knowledgeTools := tools.GetKnowledgeTools(databaseDB, routerRetriever, &retriever.Options{
+		TopK:           utils.ValueToPtr(10),
+		ScoreThreshold: utils.ValueToPtr(0.2),
+	})
+
+	ag, err := agent.NewAgentBuilder(cm).
+		WithMemory(provider).
+		WithTools(knowledgeTools...).
+		WithInstruction("你是一个技术专家助手。当用户询问技术问题时，你应该使用 knowledge_reason 工具来搜索和分析相关信息，然后提供准确的回答。").
+		Build(ctx)
 	if err != nil {
 		log.Fatalf("创建主Agent失败: %v", err)
 	}
 
-	// 6. 测试对话 - 询问技术问题
+	runner := adk.NewRunner(ctx, adk.RunnerConfig{Agent: ag})
+
+	// 6. 测试对话
 	testQuestions := []string{
 		"什么是Go语言？它有什么特点？",
 		"能解释一下微服务架构吗？",
@@ -179,29 +180,40 @@ func main() {
 		log.Printf("\n=== 测试问题 %d ===", i+1)
 		log.Printf("用户: %s", question)
 
-		response, err := mainAgent.Generate(ctx, []*schema.Message{
+		iter := runner.Run(ctx, []*schema.Message{
 			schema.UserMessage(question),
-		}, agent.WithChatUserID(userID),
-			agent.WithChatSessionID(sessionId),
-		)
-		if err != nil {
-			log.Printf("生成回答失败: %v", err)
-			continue
-		}
+		}, adk.WithSessionValues(map[string]any{
+			"userID":    userID,
+			"sessionID": sessionId,
+		}))
 
-		log.Printf("AI助手: %s", response.Content)
+		for {
+			event, ok := iter.Next()
+			if !ok {
+				break
+			}
+			if event.Err != nil {
+				log.Printf("生成回答失败: %v", event.Err)
+				break
+			}
+			if event.Output != nil && event.Output.MessageOutput != nil {
+				if m, err := event.Output.MessageOutput.GetMessage(); err == nil && m != nil {
+					log.Printf("AI助手: %s", m.Content)
+				}
+			}
+		}
 	}
 }
 
-func getMilvusDB(em embedding.Embedder) database.Database {
-	client, err := milvusclient.New(context.Background(), &milvusclient.ClientConfig{
+func getMilvusDB(ctx context.Context, em embedding.Embedder) database.Database {
+	client, err := milvusclient.New(ctx, &milvusclient.ClientConfig{
 		Address: "127.0.0.1:19530",
 		DBName:  "",
 	})
 	if err != nil {
 		return nil
 	}
-	milvusDB, err := milvus.NewMilvus(milvus.MilvusConfig{
+	milvusDB, err := milvus.NewMilvus(ctx, milvus.MilvusConfig{
 		Client:         client,
 		CollectionName: "aggo_knowledge_vectors",
 		EmbeddingDim:   1024,
@@ -229,9 +241,6 @@ func getPostgresDB(gormSql *gorm.DB, em embedding.Embedder) database.Database {
 }
 
 func NewPostgresGorm(source string, logLevel logger.LogLevel) (*gorm.DB, error) {
-	// PostgreSQL 不需要像 MySQL 那样的 parseTime 参数
-	// 但你可能需要确保连接字符串格式正确
-
 	gdb, err := gorm.Open(postgres.Open(source), &gorm.Config{
 		DisableForeignKeyConstraintWhenMigrating: true,
 		NamingStrategy: schemaGrom.NamingStrategy{
@@ -242,7 +251,6 @@ func NewPostgresGorm(source string, logLevel logger.LogLevel) (*gorm.DB, error) 
 		panic("数据库连接失败: " + err.Error())
 	}
 
-	// 配置GORM日志
 	var gormLogger logger.Interface
 	if logLevel > 0 {
 		gormLogger = logger.Default.LogMode(logLevel)

@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"time"
 
-	"github.com/CoolBanHub/aggo/memory"
+	"github.com/CoolBanHub/aggo/memory/builtin"
 	"github.com/cloudwego/eino/schema"
 )
 
@@ -75,8 +75,8 @@ type ConversationMessageModel struct {
 // 模型转换函数
 
 // ToUserMemory 将数据库模型转换为业务模型
-func (m *UserMemoryModel) ToUserMemory() *memory.UserMemory {
-	return &memory.UserMemory{
+func (m *UserMemoryModel) ToUserMemory() *builtin.UserMemory {
+	return &builtin.UserMemory{
 		UserID:    m.UserID,
 		Memory:    m.Memory,
 		CreatedAt: m.CreatedAt,
@@ -85,7 +85,7 @@ func (m *UserMemoryModel) ToUserMemory() *memory.UserMemory {
 }
 
 // FromUserMemory 将业务模型转换为数据库模型
-func (m *UserMemoryModel) FromUserMemory(userMemory *memory.UserMemory) {
+func (m *UserMemoryModel) FromUserMemory(userMemory *builtin.UserMemory) {
 	m.UserID = userMemory.UserID
 	m.Memory = userMemory.Memory
 	m.CreatedAt = userMemory.CreatedAt
@@ -93,8 +93,8 @@ func (m *UserMemoryModel) FromUserMemory(userMemory *memory.UserMemory) {
 }
 
 // ToSessionSummary 将数据库模型转换为业务模型
-func (m *SessionSummaryModel) ToSessionSummary() *memory.SessionSummary {
-	sessionSummary := &memory.SessionSummary{
+func (m *SessionSummaryModel) ToSessionSummary() *builtin.SessionSummary {
+	sessionSummary := &builtin.SessionSummary{
 		SessionID: m.SessionID,
 		UserID:    m.UserID,
 		Summary:   m.Summary,
@@ -106,7 +106,7 @@ func (m *SessionSummaryModel) ToSessionSummary() *memory.SessionSummary {
 }
 
 // FromSessionSummary 将业务模型转换为数据库模型
-func (m *SessionSummaryModel) FromSessionSummary(sessionSummary *memory.SessionSummary) {
+func (m *SessionSummaryModel) FromSessionSummary(sessionSummary *builtin.SessionSummary) {
 	m.SessionID = sessionSummary.SessionID
 	m.UserID = sessionSummary.UserID
 	m.Summary = sessionSummary.Summary
@@ -115,12 +115,12 @@ func (m *SessionSummaryModel) FromSessionSummary(sessionSummary *memory.SessionS
 }
 
 // ToConversationMessage 将数据库模型转换为业务模型
-func (m *ConversationMessageModel) ToConversationMessage() *memory.ConversationMessage {
+func (m *ConversationMessageModel) ToConversationMessage() *builtin.ConversationMessage {
 	// Parts 现在是自定义类型，可以直接转换为 []schema.MessageInputPart
 	parts := []schema.MessageInputPart(m.Parts)
 	content := m.Content
 
-	return &memory.ConversationMessage{
+	return &builtin.ConversationMessage{
 		ID:        m.ID,
 		SessionID: m.SessionID,
 		UserID:    m.UserID,
@@ -132,7 +132,7 @@ func (m *ConversationMessageModel) ToConversationMessage() *memory.ConversationM
 }
 
 // FromConversationMessage 将业务模型转换为数据库模型
-func (m *ConversationMessageModel) FromConversationMessage(message *memory.ConversationMessage) {
+func (m *ConversationMessageModel) FromConversationMessage(message *builtin.ConversationMessage) {
 	m.ID = message.ID
 	m.SessionID = message.SessionID
 	m.UserID = message.UserID

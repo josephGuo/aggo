@@ -1,18 +1,17 @@
 package storage
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"time"
 
-	"context"
-
-	"github.com/CoolBanHub/aggo/memory"
+	"github.com/CoolBanHub/aggo/memory/builtin"
 	"gorm.io/gorm"
 )
 
 // SaveSessionSummary 保存会话摘要
-func (s *SQLStore) SaveSessionSummary(ctx context.Context, summary *memory.SessionSummary) error {
+func (s *SQLStore) SaveSessionSummary(ctx context.Context, summary *builtin.SessionSummary) error {
 	if summary == nil {
 		return errors.New("摘要对象不能为空")
 	}
@@ -43,7 +42,7 @@ func (s *SQLStore) SaveSessionSummary(ctx context.Context, summary *memory.Sessi
 }
 
 // GetSessionSummary 获取会话摘要
-func (s *SQLStore) GetSessionSummary(ctx context.Context, sessionID string, userID string) (*memory.SessionSummary, error) {
+func (s *SQLStore) GetSessionSummary(ctx context.Context, sessionID string, userID string) (*builtin.SessionSummary, error) {
 	if sessionID == "" {
 		return nil, errors.New("会话ID不能为空")
 	}
@@ -64,7 +63,7 @@ func (s *SQLStore) GetSessionSummary(ctx context.Context, sessionID string, user
 }
 
 // UpdateSessionSummary 更新会话摘要
-func (s *SQLStore) UpdateSessionSummary(ctx context.Context, summary *memory.SessionSummary) error {
+func (s *SQLStore) UpdateSessionSummary(ctx context.Context, summary *builtin.SessionSummary) error {
 	if summary == nil {
 		return errors.New("摘要对象不能为空")
 	}

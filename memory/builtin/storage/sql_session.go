@@ -6,13 +6,13 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/CoolBanHub/aggo/memory"
+	"github.com/CoolBanHub/aggo/memory/builtin"
 	"github.com/CoolBanHub/aggo/utils"
 	"github.com/gookit/slog"
 )
 
 // SaveMessage 保存对话消息
-func (s *SQLStore) SaveMessage(ctx context.Context, message *memory.ConversationMessage) error {
+func (s *SQLStore) SaveMessage(ctx context.Context, message *builtin.ConversationMessage) error {
 	if message == nil {
 		return errors.New("消息对象不能为空")
 	}
@@ -46,7 +46,7 @@ func (s *SQLStore) SaveMessage(ctx context.Context, message *memory.Conversation
 }
 
 // GetMessages 获取会话的消息历史
-func (s *SQLStore) GetMessages(ctx context.Context, sessionID string, userID string, limit int) ([]*memory.ConversationMessage, error) {
+func (s *SQLStore) GetMessages(ctx context.Context, sessionID string, userID string, limit int) ([]*builtin.ConversationMessage, error) {
 	if sessionID == "" {
 		return nil, errors.New("会话ID不能为空")
 	}
@@ -68,7 +68,7 @@ func (s *SQLStore) GetMessages(ctx context.Context, sessionID string, userID str
 	}
 
 	// 转换为业务模型
-	var messages []*memory.ConversationMessage
+	var messages []*builtin.ConversationMessage
 	for _, model := range models {
 		messages = append(messages, model.ToConversationMessage())
 	}

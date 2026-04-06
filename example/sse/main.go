@@ -11,10 +11,13 @@ import (
 
 	"github.com/CoolBanHub/aggo/agent"
 	"github.com/CoolBanHub/aggo/memory"
-	"github.com/CoolBanHub/aggo/memory/storage"
+	"github.com/CoolBanHub/aggo/memory/builtin"
+	"github.com/CoolBanHub/aggo/memory/builtin/storage"
 	"github.com/CoolBanHub/aggo/model"
+	"github.com/CoolBanHub/aggo/pkg/adapter"
 	"github.com/CoolBanHub/aggo/pkg/sse"
 	"github.com/CoolBanHub/aggo/utils"
+	"github.com/cloudwego/eino/adk"
 	model2 "github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
 	"gorm.io/driver/mysql"
@@ -34,8 +37,9 @@ type ChatResponse struct {
 	Done      bool   `json:"done"`
 }
 
-var globalBot *agent.Agent
-var globalMemoryManager *memory.MemoryManager
+var globalAgent adk.Agent
+var globalRunner *adk.Runner
+var globalMemoryProvider memory.MemoryProvider
 var cm model2.ToolCallingChatModel
 
 func main() {
@@ -44,7 +48,7 @@ func main() {
 	if err := initializeBot(ctx); err != nil {
 		log.Fatalf("Failed to initialize bot: %v", err)
 	}
-	defer globalMemoryManager.Close()
+	defer globalMemoryProvider.Close()
 
 	http.HandleFunc("/", indexHandler)
 	http.HandleFunc("/api/chat", chatHandler)
@@ -85,23 +89,31 @@ func initializeBot(ctx context.Context) error {
 		return fmt.Errorf("new sql store fail,err:%s", err)
 	}
 
-	globalMemoryManager, err = memory.NewMemoryManager(cm, s, &memory.MemoryConfig{
-		EnableSessionSummary: false,
-		EnableUserMemories:   false,
-		MemoryLimit:          8,
-		Retrieval:            memory.RetrievalLastN,
+	globalMemoryProvider, err = memory.GlobalRegistry().CreateProvider("builtin", &builtin.ProviderConfig{
+		ChatModel: cm,
+		Storage:   s,
+		MemoryConfig: &builtin.MemoryConfig{
+			EnableSessionSummary: false,
+			EnableUserMemories:   false,
+			MemoryLimit:          8,
+			Retrieval:            builtin.RetrievalLastN,
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("new manager fail,err:%s", err)
 	}
 
-	globalBot, err = agent.NewAgent(ctx, cm,
-		agent.WithMemoryManager(globalMemoryManager),
-		agent.WithSystemPrompt("你是一名28岁的厦门女孩,名叫mary,是一名短视频剪辑师，主要剪辑电影类。喜欢养狗，家里有一只金毛，它叫小黄。喜欢宅在家里刷剧。不喜欢吃水果。性格内向高冷，别人不问的时候，一般都不回答自己的信息"),
-	)
+	globalAgent, err = agent.NewAgentBuilder(cm).
+		WithName("mary").
+		WithDescription("Mary 聊天助手").
+		WithInstruction("你是一名28岁的厦门女孩,名叫mary,是一名短视频剪辑师，主要剪辑电影类。喜欢养狗，家里有一只金毛，它叫小黄。喜欢宅在家里刷剧。不喜欢吃水果。性格内向高冷，别人不问的时候，一般都不回答自己的信息").
+		WithMemory(globalMemoryProvider).
+		Build(ctx)
 	if err != nil {
 		return fmt.Errorf("new agent fail,err:%s", err)
 	}
+
+	globalRunner = adk.NewRunner(ctx, adk.RunnerConfig{Agent: globalAgent})
 
 	return nil
 }
@@ -478,17 +490,6 @@ func chatHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
-	input := []*schema.Message{
-		schema.UserMessage(req.Message),
-	}
-
-	stream, err := cm.Stream(ctx, input)
-	if err != nil {
-		log.Printf("Error creating stream: %v", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
-	}
-	defer stream.Close()
 
 	writer := sse.NewWriter(sessionID, w)
 	if writer == nil {
@@ -497,12 +498,40 @@ func chatHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer writer.Close()
 
-	err = writer.Stream(ctx, stream, func(output *schema.Message, index int) any {
-		return model.OutStreamMessageEinoToOpenai(output, index)
-	})
-	if err != nil && err != context.Canceled && err != context.DeadlineExceeded {
-		log.Printf("Stream error: %v", err)
+	iter := globalRunner.Run(ctx, []*schema.Message{
+		schema.UserMessage(req.Message),
+	}, adk.WithSessionValues(map[string]any{
+		"userID":    "sse-user",
+		"sessionID": sessionID,
+	}))
+
+	for {
+		event, ok := iter.Next()
+		if !ok {
+			break
+		}
+		if event.Err != nil {
+			log.Printf("Event error: %v", event.Err)
+			break
+		}
+		if event.Output != nil && event.Output.MessageOutput != nil {
+			msg, err := event.Output.MessageOutput.GetMessage()
+			if err != nil || msg == nil {
+				continue
+			}
+			if msg.Content == "" && msg.ReasoningContent == "" {
+				continue
+			}
+			openaiResp := adapter.MessageToOpenaiStreamResponse(msg, 0)
+			if openaiResp == nil {
+				continue
+			}
+			if err := writer.WriteJSONData(openaiResp); err != nil {
+				break
+			}
+		}
 	}
+	_ = writer.WriteDone()
 }
 
 func NewMysqlGrom(source string, logLevel logger.LogLevel) (*gorm.DB, error) {
