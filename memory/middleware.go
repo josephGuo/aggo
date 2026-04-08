@@ -120,27 +120,38 @@ func (m *MemoryMiddleware) AfterModelRewriteState(ctx context.Context, state *ad
 		return ctx, state, nil
 	}
 
-	// Find the last user and assistant messages
-	var userMsg, assistantMsg *schema.Message
-	for i := len(state.Messages) - 1; i >= 0; i-- {
-		if assistantMsg == nil && state.Messages[i].Role == schema.Assistant && state.Messages[i].Content != "" {
-			assistantMsg = state.Messages[i]
-		}
-		if userMsg == nil && state.Messages[i].Role == schema.User {
+	if len(state.Messages) == 0 {
+		return ctx, state, nil
+	}
+
+	latestMsg := state.Messages[len(state.Messages)-1]
+	if latestMsg == nil || latestMsg.Role != schema.Assistant {
+		return ctx, state, nil
+	}
+
+	// Only persist the final natural-language assistant reply for this turn.
+	// Intermediate assistant messages that contain tool calls are not final
+	// user-visible answers and should never be stored as memories, even if
+	// providers/models also include explanatory text in the same message.
+	if len(latestMsg.ToolCalls) > 0 || strings.TrimSpace(latestMsg.Content) == "" {
+		return ctx, state, nil
+	}
+
+	// Find the latest user message for the current turn.
+	var userMsg *schema.Message
+	for i := len(state.Messages) - 2; i >= 0; i-- {
+		if state.Messages[i].Role == schema.User {
 			userMsg = state.Messages[i]
-		}
-		if userMsg != nil && assistantMsg != nil {
 			break
 		}
 	}
+	assistantMsg := latestMsg
 
 	var messagesToMemorize []*schema.Message
 	if userMsg != nil {
 		messagesToMemorize = append(messagesToMemorize, userMsg)
 	}
-	if assistantMsg != nil {
-		messagesToMemorize = append(messagesToMemorize, assistantMsg)
-	}
+	messagesToMemorize = append(messagesToMemorize, assistantMsg)
 
 	if len(messagesToMemorize) > 0 {
 		go func() {

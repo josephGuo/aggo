@@ -6,6 +6,11 @@ import (
 	"github.com/cloudwego/eino/schema"
 )
 
+// ptrTo returns a pointer to the given value.
+func ptrTo[T any](v T) *T {
+	return &v
+}
+
 // ToSchemaMessage 将 ConversationMessage 转换为 schema.Message
 // 统一转换逻辑，避免在多处重复实现
 func (m *ConversationMessage) ToSchemaMessage() *schema.Message {
@@ -44,6 +49,10 @@ type SessionSummary struct {
 	UserID string `json:"userId"`
 	// 摘要内容
 	Summary string `json:"summary"`
+	// 上次已纳入摘要的最后一条消息ID
+	LastSummarizedMessageID string `json:"lastSummarizedMessageId,omitempty"`
+	// 上次已纳入摘要的最后一条消息时间
+	LastSummarizedMessageAt time.Time `json:"lastSummarizedMessageAt,omitempty"`
 	// 创建时间
 	CreatedAt time.Time `json:"createdAt"`
 	// 最后更新时间
@@ -93,9 +102,15 @@ type MemoryConfig struct {
 	MemoryLimit int `json:"memoryLimit"`
 	// 异步处理的goroutine池大小
 	AsyncWorkerPoolSize int `json:"asyncWorkerPoolSize"`
+	// 记忆任务聚合窗口（秒），同一用户+会话在该窗口内的多次请求只执行一次记忆分析
+	// 默认30秒，设为0则每次回复后立即执行（向后兼容）
+	DebounceWindowSeconds *int `json:"debounceWindowSeconds,omitempty"`
 
 	// 摘要触发配置
 	SummaryTrigger SummaryTriggerConfig `json:"summaryTrigger"`
+
+	// 会话摘要缓存配置
+	SummaryCache SummaryCacheConfig `json:"summaryCache"`
 
 	TablePre string `json:"tablePre"`
 
@@ -115,18 +130,31 @@ type CleanupConfig struct {
 	CleanupInterval int `json:"cleanupInterval"`
 }
 
+// SummaryCacheConfig 会话摘要缓存配置
+type SummaryCacheConfig struct {
+	// TTLSeconds 表示单条摘要缓存 TTL，单位秒
+	TTLSeconds int `json:"ttlSeconds"`
+	// MaxEntries 表示缓存最多保留多少条会话摘要
+	MaxEntries int `json:"maxEntries"`
+}
+
 // DefaultMemoryConfig 返回完整的默认配置
 func DefaultMemoryConfig() *MemoryConfig {
 	return &MemoryConfig{
-		EnableUserMemories:   true,
-		EnableSessionSummary: false,
-		Retrieval:            RetrievalLastN,
-		MemoryLimit:          20,
-		AsyncWorkerPoolSize:  5,
+		EnableUserMemories:    true,
+		EnableSessionSummary:  false,
+		Retrieval:             RetrievalLastN,
+		MemoryLimit:           20,
+		AsyncWorkerPoolSize:   5,
+		DebounceWindowSeconds: ptrTo(30),
 		SummaryTrigger: SummaryTriggerConfig{
 			Strategy:         TriggerSmart,
 			MessageThreshold: 10,
 			MinInterval:      600, // 600秒最小间隔
+		},
+		SummaryCache: SummaryCacheConfig{
+			TTLSeconds: int(defaultSessionSummaryCacheTTL / time.Second),
+			MaxEntries: defaultSessionSummaryCacheMaxEntries,
 		},
 		Cleanup: CleanupConfig{
 			SessionCleanupInterval: 24,   // 24小时

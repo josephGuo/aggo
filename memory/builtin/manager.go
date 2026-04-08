@@ -26,6 +26,7 @@ type MemoryManager struct {
 
 	// 摘要触发管理
 	summaryTrigger *SummaryTriggerManager
+	summaryCache   *sessionSummaryCache
 
 	// 异步处理相关
 	taskChannel chan asyncTask
@@ -45,6 +46,10 @@ type MemoryManager struct {
 	// 异步任务处理去重标记，防止同一(任务类型,用户,会话)多次排队
 	pendingTasks sync.Map
 
+	// 记忆任务聚合（debounce）相关
+	memoryTimers   sync.Map      // key: "memory:{userID}:{sessionID}", value: *time.Timer
+	debounceWindow time.Duration // 聚合窗口时长，0 表示不做聚合
+
 	// 外部注入的清理函数
 	CleanupOldMessagesFunc     func(ctx context.Context) error // 按时间清理旧消息
 	CleanupMessagesByLimitFunc func(ctx context.Context) error // 按数量限制清理消息
@@ -59,33 +64,7 @@ type asyncTask struct {
 
 // NewMemoryManager 创建新的记忆管理器
 func NewMemoryManager(cm model.ToolCallingChatModel, memoryStorage MemoryStorage, config *MemoryConfig) (*MemoryManager, error) {
-	if config == nil {
-		config = DefaultMemoryConfig()
-	}
-
-	// 填充零值字段的默认值
-	defaults := DefaultMemoryConfig()
-	if config.MemoryLimit <= 0 {
-		config.MemoryLimit = defaults.MemoryLimit
-	}
-	if config.AsyncWorkerPoolSize <= 0 {
-		config.AsyncWorkerPoolSize = defaults.AsyncWorkerPoolSize
-	}
-	if config.SummaryTrigger.MessageThreshold <= 0 {
-		config.SummaryTrigger.MessageThreshold = defaults.SummaryTrigger.MessageThreshold
-	}
-	if config.Cleanup.CleanupInterval <= 0 {
-		config.Cleanup.CleanupInterval = defaults.Cleanup.CleanupInterval
-	}
-	if config.Cleanup.SessionCleanupInterval <= 0 {
-		config.Cleanup.SessionCleanupInterval = defaults.Cleanup.SessionCleanupInterval
-	}
-	if config.Cleanup.SessionRetentionTime <= 0 {
-		config.Cleanup.SessionRetentionTime = defaults.Cleanup.SessionRetentionTime
-	}
-	if config.Cleanup.MessageHistoryLimit <= 0 {
-		config.Cleanup.MessageHistoryLimit = defaults.Cleanup.MessageHistoryLimit
-	}
+	config = normalizeMemoryConfig(config)
 
 	// 设置表前缀
 	if config.TablePre != "" {
@@ -106,10 +85,15 @@ func NewMemoryManager(cm model.ToolCallingChatModel, memoryStorage MemoryStorage
 		userMemoryAnalyzer:      NewUserMemoryAnalyzer(cm),
 		sessionSummaryGenerator: NewSessionSummaryGenerator(cm),
 		summaryTrigger:          NewSummaryTriggerManager(config.SummaryTrigger),
-		ctx:                     ctx,
-		cancel:                  cancel,
-		cleanupCtx:              cleanupCtx,
-		cleanupCancel:           cleanupCancel,
+		summaryCache: newSessionSummaryCache(
+			time.Duration(config.SummaryCache.TTLSeconds)*time.Second,
+			config.SummaryCache.MaxEntries,
+		),
+		ctx:            ctx,
+		cancel:         cancel,
+		cleanupCtx:     cleanupCtx,
+		cleanupCancel:  cleanupCancel,
+		debounceWindow: debounceWindowFromConfig(config),
 	}
 
 	// 初始化goroutine池
@@ -157,7 +141,7 @@ func (m *MemoryManager) submitAsyncTask(task asyncTask) bool {
 	taskKey := fmt.Sprintf("%s:%s:%s", task.taskType, task.userID, task.sessionID)
 	// 如果相同签名（任务类型+用户+会话）的任务已在队列中，则丢弃当前重复提交，节省开销
 	if _, loaded := m.pendingTasks.LoadOrStore(taskKey, struct{}{}); loaded {
-		slog.Debugf("异步任务去重: 已存在相同的待处理任务, 类型: %s, 用户: %s", task.taskType, task.userID)
+		//slog.Debugf("异步任务去重: 已存在相同的待处理任务, 类型: %s, 用户: %s", task.taskType, task.userID)
 		return true // 返回 true 表示"已接收处理"（虽然是去重扔掉的），不视为"队列满丢弃"
 	}
 
@@ -176,6 +160,44 @@ func (m *MemoryManager) submitAsyncTask(task asyncTask) bool {
 			task.taskType, task.userID)
 		return false
 	}
+}
+
+// scheduleMemoryTask 调度记忆分析任务，支持聚合窗口（debounce）
+// 首次请求后启动 debounceWindow 定时器，期间的新请求不重置定时器，到期统一处理一次
+func (m *MemoryManager) scheduleMemoryTask(userID, sessionID string) {
+	// debounceWindow 为 0 时，保持原有行为：立即提交
+	if m.debounceWindow <= 0 {
+		submitted := m.submitAsyncTask(asyncTask{
+			taskType:  "memory",
+			userID:    userID,
+			sessionID: sessionID,
+		})
+		if !submitted {
+			slog.Errorf("警告: 用户记忆分析队列已满，跳过处理: userID=%s\n", userID)
+		}
+		return
+	}
+
+	timerKey := fmt.Sprintf("memory:%s:%s", userID, sessionID)
+
+	// 如果已有定时器，说明窗口内已有一次请求在等待，直接返回
+	if _, loaded := m.memoryTimers.Load(timerKey); loaded {
+		return
+	}
+
+	// 启动延迟定时器
+	timer := time.AfterFunc(m.debounceWindow, func() {
+		m.memoryTimers.Delete(timerKey)
+		submitted := m.submitAsyncTask(asyncTask{
+			taskType:  "memory",
+			userID:    userID,
+			sessionID: sessionID,
+		})
+		if !submitted {
+			slog.Errorf("警告: 用户记忆分析队列已满，跳过处理: userID=%s\n", userID)
+		}
+	})
+	m.memoryTimers.Store(timerKey, timer)
 }
 
 // GetTaskQueueStats 获取异步任务队列统计
@@ -346,14 +368,7 @@ func (m *MemoryManager) ProcessAssistantMessage(ctx context.Context, userID, ses
 
 	// 如果启用了用户记忆，分析消息并创建记忆（在AI回复后触发）
 	if m.config.EnableUserMemories {
-		submitted := m.submitAsyncTask(asyncTask{
-			taskType:  "memory",
-			userID:    userID,
-			sessionID: sessionID,
-		})
-		if !submitted {
-			slog.Errorf("警告: 用户记忆分析队列已满，跳过处理: userID=%s\n", userID)
-		}
+		m.scheduleMemoryTask(userID, sessionID)
 	}
 
 	return nil
@@ -414,37 +429,67 @@ func (m *MemoryManager) analyzeAndCreateUserMemory(ctx context.Context, userID, 
 
 // shouldTriggerSummaryUpdate 判断是否需要触发摘要更新
 func (m *MemoryManager) shouldTriggerSummaryUpdate(ctx context.Context, userID, sessionID string) (bool, error) {
-	// 直接获取消息数量，避免加载全量消息到内存
-	messageCount, err := m.storage.GetMessageCount(ctx, userID, sessionID)
+	existingSummary, err := m.GetSessionSummary(ctx, sessionID, userID)
+	if err != nil {
+		return false, fmt.Errorf("获取会话摘要失败: %w", err)
+	}
+
+	if existingSummary == nil {
+		totalMessageCount, err := m.storage.GetMessageCount(ctx, userID, sessionID)
+		if err != nil {
+			return false, fmt.Errorf("获取消息总数失败: %w", err)
+		}
+		if totalMessageCount == 0 {
+			return false, nil
+		}
+		return m.shouldTriggerSummaryBySnapshot(time.Time{}, totalMessageCount, totalMessageCount, false), nil
+	}
+
+	unsummarizedCount, err := m.getUnsummarizedMessageCount(
+		ctx,
+		sessionID,
+		userID,
+		existingSummary.LastSummarizedMessageID,
+		effectiveSummaryBoundary(existingSummary),
+	)
+	if err != nil {
+		return false, fmt.Errorf("获取未摘要消息数量失败: %w", err)
+	}
+
+	totalMessageCount, err := m.storage.GetMessageCount(ctx, userID, sessionID)
 	if err != nil {
 		return false, fmt.Errorf("获取消息总数失败: %w", err)
 	}
 
-	sessionKey := generateSessionKey(userID, sessionID)
-	return m.summaryTrigger.ShouldTriggerSummary(sessionKey, messageCount), nil
+	return m.shouldTriggerSummaryBySnapshot(existingSummary.UpdatedAt, unsummarizedCount, totalMessageCount, true), nil
 }
 
 // updateSessionSummary 更新会话摘要（使用AI生成）
 func (m *MemoryManager) updateSessionSummary(ctx context.Context, userID, sessionID string) error {
-	// 获取最近的消息用于增量更新
-	recentMessages, err := m.storage.GetMessages(ctx, sessionID, userID, 10) // 最近10条消息
-	if err != nil {
-		return err
-	}
-
-	if len(recentMessages) == 0 {
-		return nil
-	}
-
 	// 检查是否已存在摘要
-	existingSummary, err := m.storage.GetSessionSummary(ctx, sessionID, userID)
+	existingSummary, err := m.GetSessionSummary(ctx, sessionID, userID)
 	if err != nil {
 		return err
 	}
 
 	var summaryContent string
 	if existingSummary != nil {
-		// 使用增量摘要生成（基于现有摘要和最新消息）
+		recentMessages, err := m.getMessagesAfterCursor(
+			ctx,
+			sessionID,
+			userID,
+			existingSummary.LastSummarizedMessageID,
+			effectiveSummaryBoundary(existingSummary),
+			0,
+		)
+		if err != nil {
+			return fmt.Errorf("获取未摘要消息失败: %w", err)
+		}
+		if len(recentMessages) == 0 {
+			return nil
+		}
+
+		// 使用增量摘要生成（基于现有摘要和游标后的最新消息）
 		summaryContent, err = m.sessionSummaryGenerator.GenerateIncrementalSummary(
 			ctx, recentMessages, existingSummary.Summary)
 		if err != nil {
@@ -453,12 +498,21 @@ func (m *MemoryManager) updateSessionSummary(ctx context.Context, userID, sessio
 
 		// 更新现有摘要
 		existingSummary.Summary = summaryContent
-		return m.storage.UpdateSessionSummary(ctx, existingSummary)
+		lastMessage := recentMessages[len(recentMessages)-1]
+		existingSummary.LastSummarizedMessageID = lastMessage.ID
+		existingSummary.LastSummarizedMessageAt = lastMessage.CreatedAt
+		if err := m.storage.UpdateSessionSummary(ctx, existingSummary); err != nil {
+			return err
+		}
+		m.cacheSessionSummary(existingSummary)
+		return nil
 	} else {
-		// 获取更多历史消息用于生成完整摘要
-		allMessages, err := m.storage.GetMessages(ctx, sessionID, userID, 20) // 最近20条消息
+		allMessages, err := m.storage.GetMessages(ctx, sessionID, userID, 0)
 		if err != nil {
 			return err
+		}
+		if len(allMessages) == 0 {
+			return nil
 		}
 
 		// 生成新摘要
@@ -467,13 +521,20 @@ func (m *MemoryManager) updateSessionSummary(ctx context.Context, userID, sessio
 			return fmt.Errorf("生成新摘要失败: %w", err)
 		}
 
+		lastMessage := allMessages[len(allMessages)-1]
 		// 创建新摘要
 		summary := &SessionSummary{
-			SessionID: sessionID,
-			UserID:    userID,
-			Summary:   summaryContent,
+			SessionID:               sessionID,
+			UserID:                  userID,
+			Summary:                 summaryContent,
+			LastSummarizedMessageID: lastMessage.ID,
+			LastSummarizedMessageAt: lastMessage.CreatedAt,
 		}
-		return m.storage.SaveSessionSummary(ctx, summary)
+		if err := m.storage.SaveSessionSummary(ctx, summary); err != nil {
+			return err
+		}
+		m.cacheSessionSummary(summary)
+		return nil
 	}
 }
 
@@ -494,7 +555,19 @@ func (m *MemoryManager) ClearUserMemory(ctx context.Context, userID string) erro
 
 // GetSessionSummary 获取会话摘要
 func (m *MemoryManager) GetSessionSummary(ctx context.Context, sessionID, userID string) (*SessionSummary, error) {
-	return m.storage.GetSessionSummary(ctx, sessionID, userID)
+	sessionKey := generateSessionKey(userID, sessionID)
+	if m.summaryCache != nil {
+		if summary, ok := m.summaryCache.Get(sessionKey); ok {
+			return summary, nil
+		}
+	}
+
+	summary, err := m.storage.GetSessionSummary(ctx, sessionID, userID)
+	if err != nil || summary == nil {
+		return summary, err
+	}
+	m.cacheSessionSummary(summary)
+	return cloneSessionSummary(summary), nil
 }
 
 // SaveMessage 保存消息
@@ -505,6 +578,33 @@ func (m *MemoryManager) SaveMessage(ctx context.Context, message *ConversationMe
 // GetMessages 获取会话消息
 func (m *MemoryManager) GetMessages(ctx context.Context, sessionID, userID string, limit int) ([]*schema.Message, error) {
 	messages, err := m.storage.GetMessages(ctx, sessionID, userID, limit)
+	if err != nil {
+		return nil, err
+	}
+
+	list := make([]*schema.Message, len(messages))
+	for i, v := range messages {
+		list[i] = v.ToSchemaMessage()
+	}
+	return list, nil
+}
+
+// GetMessagesAfterSummary returns only the messages that have not yet been folded into the persisted session summary.
+// For legacy summaries without a cursor, it falls back to messages created after the summary update time.
+func (m *MemoryManager) GetMessagesAfterSummary(ctx context.Context, sessionID, userID string, limit int) ([]*schema.Message, error) {
+	summary, err := m.GetSessionSummary(ctx, sessionID, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	var afterID string
+	var afterTime time.Time
+	if summary != nil {
+		afterID = summary.LastSummarizedMessageID
+		afterTime = effectiveSummaryBoundary(summary)
+	}
+
+	messages, err := m.getMessagesAfterCursor(ctx, sessionID, userID, afterID, afterTime, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -527,7 +627,31 @@ func (m *MemoryManager) UpdateConfig(config *MemoryConfig) {
 		return
 	}
 
+	currentCacheTTLSeconds := 0
+	currentCacheMaxEntries := 0
+	if m.summaryCache != nil {
+		currentCacheTTLSeconds = int(m.summaryCache.ttl / time.Second)
+		currentCacheMaxEntries = m.summaryCache.maxEntries
+	} else if m.config != nil {
+		currentCacheTTLSeconds = m.config.SummaryCache.TTLSeconds
+		currentCacheMaxEntries = m.config.SummaryCache.MaxEntries
+	}
+
+	config = normalizeMemoryConfig(config)
 	m.config = config
+	m.summaryTrigger = NewSummaryTriggerManager(config.SummaryTrigger)
+	m.debounceWindow = debounceWindowFromConfig(config)
+
+	// Recreate the cache only when the currently applied cache parameters
+	// differ from the requested ones. Compare against the live cache state
+	// instead of m.config so in-place mutations of GetConfig() are detected.
+	if currentCacheTTLSeconds != config.SummaryCache.TTLSeconds ||
+		currentCacheMaxEntries != config.SummaryCache.MaxEntries {
+		m.summaryCache = newSessionSummaryCache(
+			time.Duration(config.SummaryCache.TTLSeconds)*time.Second,
+			config.SummaryCache.MaxEntries,
+		)
+	}
 
 	// 停止旧的定期清理任务并等待退出
 	m.cleanupCancel()
@@ -576,10 +700,236 @@ func (m *MemoryManager) Close() error {
 		m.cleanupWg.Wait()
 	}
 
+	// 停止所有聚合定时器，阻止新的记忆任务入队
+	m.memoryTimers.Range(func(key, value interface{}) bool {
+		if timer, ok := value.(*time.Timer); ok {
+			timer.Stop()
+		}
+		m.memoryTimers.Delete(key)
+		return true
+	})
+
 	// 通知所有 worker 退出，等待退出后再关闭 channel
 	m.cancel()
 	m.wg.Wait()
 	close(m.taskChannel)
 
 	return m.storage.Close()
+}
+
+func (m *MemoryManager) cacheSessionSummary(summary *SessionSummary) {
+	if m.summaryCache == nil || summary == nil {
+		return
+	}
+	m.summaryCache.Set(generateSessionKey(summary.UserID, summary.SessionID), summary)
+}
+
+func (m *MemoryManager) shouldTriggerSummaryBySnapshot(lastSummaryTime time.Time, unsummarizedCount, totalMessageCount int, hasSummary bool) bool {
+	if unsummarizedCount <= 0 && hasSummary {
+		return false
+	}
+
+	cfg := m.summaryTrigger.config
+	threshold := cfg.MessageThreshold
+	if threshold <= 0 {
+		threshold = DefaultMemoryConfig().SummaryTrigger.MessageThreshold
+	}
+	minInterval := cfg.MinInterval
+	if minInterval <= 0 {
+		minInterval = DefaultMemoryConfig().SummaryTrigger.MinInterval
+	}
+
+	switch cfg.Strategy {
+	case TriggerAlways:
+		if hasSummary {
+			return unsummarizedCount > 0
+		}
+		return totalMessageCount >= threshold
+	case TriggerByMessages:
+		if hasSummary {
+			return unsummarizedCount >= threshold
+		}
+		return totalMessageCount >= threshold
+	case TriggerByTime:
+		if !hasSummary {
+			return totalMessageCount >= threshold
+		}
+		return unsummarizedCount > 0 && time.Since(lastSummaryTime).Seconds() >= float64(minInterval)
+	case TriggerSmart:
+		if !hasSummary {
+			return totalMessageCount >= threshold
+		}
+		return m.summaryTrigger.shouldTriggerSmart(&SessionState{
+			LastSummaryTime:          lastSummaryTime,
+			MessagesSinceLastSummary: unsummarizedCount,
+			TotalMessages:            totalMessageCount,
+		})
+	default:
+		if hasSummary {
+			return unsummarizedCount > 0
+		}
+		return totalMessageCount >= threshold
+	}
+}
+
+func unsummarizedMessages(messages []*ConversationMessage, summary *SessionSummary) []*ConversationMessage {
+	if len(messages) == 0 {
+		return nil
+	}
+	if summary == nil {
+		return messages
+	}
+
+	filtered := make([]*ConversationMessage, 0, len(messages))
+	for _, msg := range messages {
+		if messageAfterSummary(msg, summary) {
+			filtered = append(filtered, msg)
+		}
+	}
+	return filtered
+}
+
+// messageAfterSummary reports whether message was created after the summary cursor.
+//
+// Cursor comparison uses two fields:
+//   - LastSummarizedMessageAt (primary): timestamp of the last summarized message.
+//   - LastSummarizedMessageID (tie-breaker): string comparison by ID for messages
+//     sharing the same timestamp. This relies on IDs being lexicographically
+//     monotonically increasing (e.g., ULID, UUIDv7). Random IDs would break this.
+//
+// For legacy summaries that predate cursor fields, falls back to UpdatedAt.
+func messageAfterSummary(message *ConversationMessage, summary *SessionSummary) bool {
+	if message == nil {
+		return false
+	}
+	if summary == nil {
+		return true
+	}
+
+	if summary.LastSummarizedMessageID != "" || !summary.LastSummarizedMessageAt.IsZero() {
+		if !summary.LastSummarizedMessageAt.IsZero() {
+			if message.CreatedAt.After(summary.LastSummarizedMessageAt) {
+				return true
+			}
+			if message.CreatedAt.Before(summary.LastSummarizedMessageAt) {
+				return false
+			}
+		}
+		if summary.LastSummarizedMessageID != "" {
+			return message.ID > summary.LastSummarizedMessageID
+		}
+		return false
+	}
+
+	// Legacy summaries created before cursor fields existed fall back to the
+	// summary update time as the best available boundary.
+	return message.CreatedAt.After(summary.UpdatedAt)
+}
+
+func effectiveSummaryBoundary(summary *SessionSummary) time.Time {
+	if summary == nil {
+		return time.Time{}
+	}
+	if !summary.LastSummarizedMessageAt.IsZero() {
+		return summary.LastSummarizedMessageAt
+	}
+	return summary.UpdatedAt
+}
+
+// debounceWindowFromConfig extracts the debounce window duration from config.
+func debounceWindowFromConfig(config *MemoryConfig) time.Duration {
+	if config.DebounceWindowSeconds != nil {
+		return time.Duration(*config.DebounceWindowSeconds) * time.Second
+	}
+	return 30 * time.Second
+}
+
+func normalizeMemoryConfig(config *MemoryConfig) *MemoryConfig {
+	if config == nil {
+		config = DefaultMemoryConfig()
+	}
+
+	defaults := DefaultMemoryConfig()
+	if config.MemoryLimit <= 0 {
+		config.MemoryLimit = defaults.MemoryLimit
+	}
+	if config.AsyncWorkerPoolSize <= 0 {
+		config.AsyncWorkerPoolSize = defaults.AsyncWorkerPoolSize
+	}
+	if config.DebounceWindowSeconds == nil {
+		config.DebounceWindowSeconds = defaults.DebounceWindowSeconds
+	}
+	if config.SummaryTrigger.MessageThreshold <= 0 {
+		config.SummaryTrigger.MessageThreshold = defaults.SummaryTrigger.MessageThreshold
+	}
+	if config.SummaryTrigger.MinInterval <= 0 {
+		config.SummaryTrigger.MinInterval = defaults.SummaryTrigger.MinInterval
+	}
+	if config.SummaryCache.TTLSeconds <= 0 {
+		config.SummaryCache.TTLSeconds = defaults.SummaryCache.TTLSeconds
+	}
+	if config.SummaryCache.MaxEntries <= 0 {
+		config.SummaryCache.MaxEntries = defaults.SummaryCache.MaxEntries
+	}
+	if config.Cleanup.CleanupInterval <= 0 {
+		config.Cleanup.CleanupInterval = defaults.Cleanup.CleanupInterval
+	}
+	if config.Cleanup.SessionCleanupInterval <= 0 {
+		config.Cleanup.SessionCleanupInterval = defaults.Cleanup.SessionCleanupInterval
+	}
+	if config.Cleanup.SessionRetentionTime <= 0 {
+		config.Cleanup.SessionRetentionTime = defaults.Cleanup.SessionRetentionTime
+	}
+	if config.Cleanup.MessageHistoryLimit <= 0 {
+		config.Cleanup.MessageHistoryLimit = defaults.Cleanup.MessageHistoryLimit
+	}
+	return config
+}
+
+// getMessagesAfterCursor returns messages after the summary cursor.
+// It prefers the efficient CursorMessageStorage path when available.
+// For stores that don't implement CursorMessageStorage (e.g., in-memory),
+// it loads all messages and filters in-process — acceptable because the
+// in-memory store is only used for testing/development.
+func (m *MemoryManager) getMessagesAfterCursor(ctx context.Context, sessionID, userID, afterMessageID string, afterTime time.Time, limit int) ([]*ConversationMessage, error) {
+	if cursorStore, ok := m.storage.(CursorMessageStorage); ok {
+		return cursorStore.GetMessagesAfter(ctx, sessionID, userID, afterMessageID, afterTime, limit)
+	}
+
+	// Fallback: load all messages and filter in-process.
+	messages, err := m.storage.GetMessages(ctx, sessionID, userID, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	filtered := unsummarizedMessages(messages, &SessionSummary{
+		LastSummarizedMessageID: afterMessageID,
+		LastSummarizedMessageAt: afterTime,
+		UpdatedAt:               afterTime,
+	})
+	if limit > 0 && len(filtered) > limit {
+		filtered = filtered[len(filtered)-limit:]
+	}
+	return filtered, nil
+}
+
+// getUnsummarizedMessageCount returns the count of messages after the summary cursor
+// without loading the full message list. Falls back to loading all messages when
+// the storage doesn't support efficient cursor counting.
+func (m *MemoryManager) getUnsummarizedMessageCount(ctx context.Context, sessionID, userID, afterMessageID string, afterTime time.Time) (int, error) {
+	if cursorStore, ok := m.storage.(CursorMessageStorage); ok {
+		return cursorStore.GetMessageCountAfter(ctx, sessionID, userID, afterMessageID, afterTime)
+	}
+
+	// Fallback: load all messages and count in-process.
+	messages, err := m.storage.GetMessages(ctx, sessionID, userID, 0)
+	if err != nil {
+		return 0, err
+	}
+	filtered := unsummarizedMessages(messages, &SessionSummary{
+		LastSummarizedMessageID: afterMessageID,
+		LastSummarizedMessageAt: afterTime,
+		UpdatedAt:               afterTime,
+	})
+	return len(filtered), nil
 }
