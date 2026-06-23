@@ -13,6 +13,7 @@ import (
 
 	"github.com/CoolBanHub/aggo/agent"
 	cronPkg "github.com/CoolBanHub/aggo/cron"
+	agmsg "github.com/CoolBanHub/aggo/internal/agentic"
 	"github.com/CoolBanHub/aggo/memory"
 	"github.com/CoolBanHub/aggo/memory/builtin"
 	builtinsearch "github.com/CoolBanHub/aggo/memory/builtin/search"
@@ -108,7 +109,7 @@ func main() {
 		log.Fatalf("Failed to create skill backend: %v", err)
 	}
 
-	skillMiddleware, err := skill.NewMiddleware(ctx, &skill.Config{
+	skillMiddleware, err := skill.NewTyped[*schema.AgenticMessage](ctx, &skill.TypedConfig[*schema.AgenticMessage]{
 		Backend: skillBackend,
 	})
 	if err != nil {
@@ -133,7 +134,7 @@ func main() {
 		MemoryConfig: &builtin.MemoryConfig{
 			EnableUserMemories:   true,
 			EnableSessionSummary: true,
-			// 启用“事件检索”模式：常驻短文档 + 最近 N 条事件注入 system，
+			// 启用“事件检索”模式：常驻短文档 + 最近 N 条事件作为动态上下文追加到当前 user 消息，
 			// 更早的事件通过 search_user_memory 工具按关键词/时间检索。
 			EnableEventSearch:   true,
 			RecentEventLimit:    10,
@@ -157,6 +158,7 @@ func main() {
 		}
 		agentTools = append(agentTools, memSearchTool)
 	}
+	agentTools = append(agentTools, adk.NewTypedAgentTool[*schema.AgenticMessage](ctx, cronAgentResult.Agent))
 
 	systemPrompt := `你是一个智能助手。
 
@@ -166,7 +168,7 @@ func main() {
 3. 回复简洁准确
 
 ## 用户长期记忆规则
-1. system 中已注入两块内容：
+1. 当前 user 消息末尾会追加两块动态上下文：
    - <user_memory> 常驻短文档（核心约定 + 基础信息）
    - <user_memory_recent_events> 最近若干条任务里程碑/事件记录（每条已含日期/类型/摘要）
 2. **优先使用上述常驻内容**回答；只有命中不到时才调用 search_user_memory
@@ -180,7 +182,6 @@ func main() {
 		WithInstruction(systemPrompt).
 		WithTools(agentTools...).
 		WithMiddlewares(skillMiddleware).
-		WithSubAgents(agent.SubAgentModeDefault, cronAgentResult.Agent).
 		WithMemory(provider).
 		Build(ctx)
 
@@ -188,7 +189,7 @@ func main() {
 		log.Fatalf("Failed to create agent: %v", err)
 	}
 
-	runner := adk.NewRunner(ctx, adk.RunnerConfig{Agent: ag})
+	runner := adk.NewTypedRunner(adk.TypedRunnerConfig[*schema.AgenticMessage]{Agent: ag})
 
 	conversations := []string{
 		"帮我创建一个google搜索的skill",
@@ -214,8 +215,8 @@ func main() {
 			)
 		}
 
-		iter := runner.Run(runCtx, []*schema.Message{
-			schema.UserMessage(msg),
+		iter := runner.Run(runCtx, []*schema.AgenticMessage{
+			schema.UserAgenticMessage(msg),
 		}, adk.WithSessionValues(map[string]any{
 			"userID":    userID,
 			"sessionID": sessionID,
@@ -231,7 +232,7 @@ func main() {
 			}
 			if event.Output != nil && event.Output.MessageOutput != nil {
 				if m, err := event.Output.MessageOutput.GetMessage(); err == nil && m != nil {
-					fmt.Printf("【回答】: %s\n\n", m.Content)
+					fmt.Printf("【回答】: %s\n\n", agmsg.Text(m))
 				}
 			}
 		}

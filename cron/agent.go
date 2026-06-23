@@ -3,7 +3,9 @@ package cron
 import (
 	"context"
 	"fmt"
+	"time"
 
+	agmsg "github.com/CoolBanHub/aggo/internal/agentic"
 	"github.com/CoolBanHub/aggo/memory"
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/components/model"
@@ -23,14 +25,15 @@ type cronConfig struct {
 	store          Store
 	onJobTriggered func(job *CronJob)
 	onJobProcessed func(job *CronJob, response string, err error)
-	middlewares    []adk.ChatModelAgentMiddleware
+	middlewares    []adk.TypedChatModelAgentMiddleware[*schema.AgenticMessage]
 	extraTools     []tool.BaseTool
 	maxJobs        int
 	maxJobsPerUser int
 	locker         Locker
-	memoryProvider  memory.MemoryProvider
+	memoryProvider memory.MemoryProvider
 	name           string
 	systemPrompt   string
+	jobTimeout     time.Duration
 }
 
 // WithFileStore 使用文件存储
@@ -90,7 +93,7 @@ func WithExtraTools(tools ...tool.BaseTool) CronAgentOption {
 }
 
 // WithCronMiddlewares 添加 Middleware
-func WithCronMiddlewares(mw ...adk.ChatModelAgentMiddleware) CronAgentOption {
+func WithCronMiddlewares(mw ...adk.TypedChatModelAgentMiddleware[*schema.AgenticMessage]) CronAgentOption {
 	return func(c *cronConfig) {
 		c.middlewares = append(c.middlewares, mw...)
 	}
@@ -117,9 +120,16 @@ func WithCronSystemPrompt(prompt string) CronAgentOption {
 	}
 }
 
+// WithCronJobTimeout caps the model call used to process triggered jobs.
+func WithCronJobTimeout(timeout time.Duration) CronAgentOption {
+	return func(c *cronConfig) {
+		c.jobTimeout = timeout
+	}
+}
+
 // CronAgentResult 定时任务 Agent 创建结果
 type CronAgentResult struct {
-	Agent   adk.Agent
+	Agent   adk.TypedAgent[*schema.AgenticMessage]
 	Service *CronService
 }
 
@@ -129,9 +139,10 @@ type cronServiceProvider interface {
 
 // NewCronAgent 创建定时任务 Agent
 // tools 参数由调用方通过 cronTool.GetTools(service) 提供，避免循环导入
-func NewCronAgent(ctx context.Context, cm model.ToolCallingChatModel, cronTools []tool.BaseTool, opts ...CronAgentOption) (*CronAgentResult, error) {
+func NewCronAgent(ctx context.Context, cm model.AgenticModel, cronTools []tool.BaseTool, opts ...CronAgentOption) (*CronAgentResult, error) {
 	cfg := &cronConfig{
 		maxJobsPerUser: defaultMaxJobsPerUser,
+		jobTimeout:     time.Minute,
 	}
 	for _, opt := range opts {
 		opt(cfg)
@@ -161,7 +172,7 @@ func NewCronAgent(ctx context.Context, cm model.ToolCallingChatModel, cronTools 
 	allTools = append(allTools, cfg.extraTools...)
 
 	// 构建 Middleware 链
-	handlers := make([]adk.ChatModelAgentMiddleware, 0, len(cfg.middlewares)+1)
+	handlers := make([]adk.TypedChatModelAgentMiddleware[*schema.AgenticMessage], 0, len(cfg.middlewares)+1)
 	if cfg.memoryProvider != nil {
 		handlers = append(handlers, memory.NewMemoryMiddleware(cfg.memoryProvider))
 	}
@@ -188,7 +199,7 @@ func NewCronAgent(ctx context.Context, cm model.ToolCallingChatModel, cronTools 
 			"如果用户请求此类操作，请拒绝并解释风险。"
 	}
 
-	agent, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
+	agent, err := adk.NewTypedChatModelAgent[*schema.AgenticMessage](ctx, &adk.TypedChatModelAgentConfig[*schema.AgenticMessage]{
 		Name:        name,
 		Description: description,
 		Instruction: systemPrompt,
@@ -212,15 +223,25 @@ func NewCronAgent(ctx context.Context, cm model.ToolCallingChatModel, cronTools 
 		})
 	} else {
 		onProcessed := cfg.onJobProcessed
+		jobTimeout := cfg.jobTimeout
 		service.SetOnJob(func(job *CronJob) (string, error) {
-			resp, err := cm.Generate(context.Background(), []*schema.Message{
-				schema.SystemMessage("你是一个提醒助手。请将以下定时任务消息转换为简洁、友好的提醒通知。直接输出一句话。"),
-				schema.UserMessage(job.Payload.Message),
+			jobCtx := context.Background()
+			var cancel context.CancelFunc
+			if jobTimeout > 0 {
+				jobCtx, cancel = context.WithTimeout(jobCtx, jobTimeout)
+			} else {
+				jobCtx, cancel = context.WithCancel(jobCtx)
+			}
+			defer cancel()
+
+			resp, err := cm.Generate(jobCtx, []*schema.AgenticMessage{
+				schema.SystemAgenticMessage("你是一个提醒助手。请将以下定时任务消息转换为简洁、友好的提醒通知。直接输出一句话。"),
+				schema.UserAgenticMessage(job.Payload.Message),
 			})
 
 			var response string
 			if resp != nil {
-				response = resp.Content
+				response = agmsg.Text(resp)
 			}
 			if onProcessed != nil {
 				onProcessed(job, response, err)

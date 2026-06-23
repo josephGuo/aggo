@@ -6,7 +6,6 @@ import (
 	"strings"
 
 	"github.com/cloudwego/eino/components/model"
-	"github.com/cloudwego/eino/schema"
 )
 
 func firstNonEmpty(values ...string) string {
@@ -48,19 +47,6 @@ func mergeMetadata(values ...map[string]any) map[string]any {
 	return out
 }
 
-func stringMapAny(in map[string]string) map[string]any {
-	if len(in) == 0 {
-		return nil
-	}
-	out := make(map[string]any, len(in))
-	for k, v := range in {
-		if strings.TrimSpace(k) != "" {
-			out[k] = v
-		}
-	}
-	return out
-}
-
 func marshalAny(value any) any {
 	if value == nil {
 		return nil
@@ -79,7 +65,7 @@ func safeJSON(value any) string {
 	return string(b)
 }
 
-func modelParameters(conf *model.Config, toolChoice *schema.ToolChoice) map[string]any {
+func agenticModelParameters(conf *model.AgenticConfig) map[string]any {
 	params := map[string]any{}
 	if conf != nil {
 		if conf.Model != "" {
@@ -94,33 +80,11 @@ func modelParameters(conf *model.Config, toolChoice *schema.ToolChoice) map[stri
 		if conf.TopP != 0 {
 			params["top_p"] = conf.TopP
 		}
-		if len(conf.Stop) > 0 {
-			params["stop"] = conf.Stop
-		}
-	}
-	if toolChoice != nil {
-		params["tool_choice"] = toolChoiceValue(toolChoice)
 	}
 	if len(params) == 0 {
 		return nil
 	}
 	return params
-}
-
-func toolChoiceValue(toolChoice *schema.ToolChoice) any {
-	if toolChoice == nil {
-		return nil
-	}
-	switch *toolChoice {
-	case schema.ToolChoiceForbidden:
-		return "none"
-	case schema.ToolChoiceAllowed:
-		return "auto"
-	case schema.ToolChoiceForced:
-		return "required"
-	default:
-		return string(*toolChoice)
-	}
 }
 
 func usageFromModel(usage *model.TokenUsage) (*usageBody, map[string]int) {

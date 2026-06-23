@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	agmsg "github.com/CoolBanHub/aggo/internal/agentic"
 	"github.com/CoolBanHub/aggo/memory/builtin"
 	builtinsearch "github.com/CoolBanHub/aggo/memory/builtin/search"
 	"github.com/cloudwego/eino/schema"
@@ -35,37 +36,30 @@ func (p *builtinProvider) Retrieve(ctx context.Context, req *RetrieveRequest) (*
 
 	var sessionSummary *builtin.SessionSummary
 
-	// Fetch user memory as system message
+	// Fetch user memory as dynamic context messages. Keeping it out of the
+	// system prompt preserves provider-side prompt caching for the stable
+	// instruction.
 	if cfg.EnableUserMemories {
 		userMemory, err := p.MemoryManager.GetUserMemory(ctx, req.UserID)
 		if err == nil && userMemory != nil && userMemory.Memory != "" {
-			result.SystemMessages = append(result.SystemMessages, &schema.Message{
-				Role:    schema.System,
-				Content: fmt.Sprintf("<user_memory>\n%s\n</user_memory>", userMemory.Memory),
-			})
+			result.ContextMessages = append(result.ContextMessages, schema.UserAgenticMessage(fmt.Sprintf("<user_memory>\n%s\n</user_memory>", userMemory.Memory)))
 		}
 
 		// 事件检索模式：再追加“最近 N 条事件”块，更早的事件由 search_user_memory 工具按需检索。
 		if cfg.EnableEventSearch && cfg.RecentEventLimit > 0 {
 			events, evtErr := p.MemoryManager.ListRecentUserMemoryEvents(ctx, req.UserID, cfg.RecentEventLimit)
 			if evtErr == nil && len(events) > 0 {
-				result.SystemMessages = append(result.SystemMessages, &schema.Message{
-					Role:    schema.System,
-					Content: formatRecentEventsBlock(events),
-				})
+				result.ContextMessages = append(result.ContextMessages, schema.UserAgenticMessage(formatRecentEventsBlock(events)))
 			}
 		}
 	}
 
-	// Fetch session summary as system message
+	// Fetch session summary as dynamic context.
 	if cfg.EnableSessionSummary {
 		summary, err := p.MemoryManager.GetSessionSummary(ctx, req.SessionID, req.UserID)
 		if err == nil && summary != nil && summary.Summary != "" {
 			sessionSummary = summary
-			result.SystemMessages = append(result.SystemMessages, &schema.Message{
-				Role:    schema.System,
-				Content: fmt.Sprintf("<session_context>\n%s\n</session_context>", summary.Summary),
-			})
+			result.ContextMessages = append(result.ContextMessages, schema.UserAgenticMessage(fmt.Sprintf("<session_context>\n%s\n</session_context>", summary.Summary)))
 		}
 	}
 
@@ -105,20 +99,25 @@ func (p *builtinProvider) Memorize(ctx context.Context, req *MemorizeRequest) er
 	}
 
 	for _, msg := range req.Messages {
-		if msg.Role == schema.User {
-			content := msg.Content
-			if content == "" && len(msg.UserInputMultiContent) > 0 {
-				content = extractTextFromParts(msg.UserInputMultiContent)
+		if msg.Role == schema.AgenticRoleTypeUser {
+			content := agmsg.Text(msg)
+			parts := agmsg.InputParts(msg)
+			if content == "" && len(parts) > 0 {
+				content = extractTextFromParts(parts)
 			}
-			if err := p.MemoryManager.ProcessUserMessage(ctx, req.UserID, req.SessionID, content, msg.UserInputMultiContent); err != nil {
+			if err := p.MemoryManager.ProcessUserMessage(ctx, req.UserID, req.SessionID, content, parts); err != nil {
 				return fmt.Errorf("save user message: %w", err)
 			}
 		}
 	}
 
 	for _, msg := range req.Messages {
-		if msg.Role == schema.Assistant && msg.Content != "" {
-			if err := p.MemoryManager.ProcessAssistantMessage(ctx, req.UserID, req.SessionID, msg.Content); err != nil {
+		if msg.Role == schema.AgenticRoleTypeAssistant {
+			content := agmsg.Text(msg)
+			if content == "" {
+				continue
+			}
+			if err := p.MemoryManager.ProcessAssistantMessage(ctx, req.UserID, req.SessionID, content); err != nil {
 				return fmt.Errorf("save assistant message: %w", err)
 			}
 		}
@@ -146,7 +145,7 @@ func (p *builtinProvider) ListRecentUserMemoryEvents(ctx context.Context, userID
 	return p.MemoryManager.ListRecentUserMemoryEvents(ctx, userID, limit)
 }
 
-// formatRecentEventsBlock 把最近事件渲染为 system message 块，控制每条字数避免冲爆 prompt。
+// formatRecentEventsBlock 把最近事件渲染为上下文块，控制每条字数避免冲爆 prompt。
 func formatRecentEventsBlock(events []*builtin.UserMemoryEvent) string {
 	var b strings.Builder
 	b.WriteString("<user_memory_recent_events>\n")
@@ -183,17 +182,17 @@ func extractTextFromParts(parts []schema.MessageInputPart) string {
 	return strings.Join(texts, "\n")
 }
 
-func decorateHistoryMessages(history []*schema.Message) []*schema.Message {
-	decorated := make([]*schema.Message, 0, len(history))
+func decorateHistoryMessages(history []*schema.AgenticMessage) []*schema.AgenticMessage {
+	decorated := make([]*schema.AgenticMessage, 0, len(history))
 	for _, msg := range history {
 		decorated = append(decorated, builtin.PrefixHistoryTimestamp(msg))
 	}
 	return decorated
 }
 
-func mergeHistoryMessages(limit int, histories ...[]*schema.Message) []*schema.Message {
+func mergeHistoryMessages(limit int, histories ...[]*schema.AgenticMessage) []*schema.AgenticMessage {
 	type item struct {
-		msg     *schema.Message
+		msg     *schema.AgenticMessage
 		order   int
 		created time.Time
 		hasTime bool
@@ -235,14 +234,14 @@ func mergeHistoryMessages(limit int, histories ...[]*schema.Message) []*schema.M
 		items = items[len(items)-limit:]
 	}
 
-	merged := make([]*schema.Message, 0, len(items))
+	merged := make([]*schema.AgenticMessage, 0, len(items))
 	for _, item := range items {
 		merged = append(merged, item.msg)
 	}
 	return merged
 }
 
-func messageExtraString(msg *schema.Message, key string) string {
+func messageExtraString(msg *schema.AgenticMessage, key string) string {
 	if msg == nil || msg.Extra == nil {
 		return ""
 	}
@@ -258,7 +257,7 @@ func messageExtraString(msg *schema.Message, key string) string {
 	}
 }
 
-func messageCreatedAt(msg *schema.Message) (time.Time, bool) {
+func messageCreatedAt(msg *schema.AgenticMessage) (time.Time, bool) {
 	raw := messageExtraString(msg, builtin.MessageExtraCreatedAtKey)
 	if raw == "" {
 		return time.Time{}, false

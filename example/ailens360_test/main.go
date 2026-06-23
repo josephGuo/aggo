@@ -8,7 +8,10 @@
 //     from the caller's context. The RoundTripper reads req.Context() on
 //     every call, so one ChatModel can serve different users/sessions
 //     without being rebuilt — just stamp ctx before agent.Run.
-//  3. Tool calling. The ReAct agent loops:
+//  3. metadata in the model request body via agenticopenai.WithExtraFields.
+//     Because it is passed to runner.Run, every model call in this agent run
+//     carries the same metadata.
+//  4. Tool calling. The ReAct agent loops:
 //     model.Stream() → if tool_calls present → run tool → feed result back
 //     → model.Stream() … until the model produces a final answer.
 //     Each model call inside one run shares the same trace_id.
@@ -17,7 +20,6 @@
 //
 //	BaseUrl                  upstream OpenAI-compatible base URL
 //	APIKey                   upstream API key (透传给上游, AILens360 不持有)
-//	Model                    model name on the upstream
 //	AILENS360_PROXY_PREFIX   e.g. https://ailens360.example.com/p
 //	AILENS360_PROJECT_KEY    64-char project key from AILens360 console
 package main
@@ -32,9 +34,11 @@ import (
 	"time"
 
 	"github.com/CoolBanHub/aggo/agent"
+	agmsg "github.com/CoolBanHub/aggo/internal/agentic"
 	"github.com/CoolBanHub/aggo/pkg/ailens360"
-	"github.com/cloudwego/eino-ext/components/model/openai"
+	"github.com/cloudwego/eino-ext/components/model/agenticopenai"
 	"github.com/cloudwego/eino/adk"
+	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/components/tool/utils"
 	"github.com/cloudwego/eino/schema"
 	"github.com/joho/godotenv"
@@ -96,19 +100,21 @@ func main() {
 	// 2) Build an openai chat model and apply the decorator. After Apply:
 	//    - cfg.BaseURL becomes "<proxy>/<upstream>"
 	//    - cfg.HTTPClient gains a RoundTripper that stamps headers
-	chatCfg := &openai.ChatModelConfig{
+	chatCfg := &agenticopenai.ChatConfig{
 		APIKey:  apiKey,
 		BaseURL: baseURL,
 		Model:   modelName,
 	}
-	decorator.Apply(chatCfg)
+	if decorator != nil {
+		decorator.ApplyAgentic(chatCfg)
+	}
 
-	chatModel, err := openai.NewChatModel(ctx, chatCfg)
+	chatModel, err := agenticopenai.NewChatModel(ctx, chatCfg)
 	if err != nil {
 		log.Fatalf("new chat model: %v", err)
 	}
 
-	// 3) Build a typed tool. aggo's agent builder accepts the same eino
+	// 3) Build a typed tool. aggo  agent builder accepts the same eino
 	//    tool interface, so InferTool works directly.
 	weatherTool, err := utils.InferTool(
 		"get_weather",
@@ -133,23 +139,29 @@ func main() {
 	//    shares the trace_id, grouped as one Langfuse-style trace.
 	sessionID := fmt.Sprintf("sess_%d", time.Now().Unix())
 	traceID := fmt.Sprintf("trace_%d", time.Now().UnixNano())
+	userID := "user_alice_42"
 	ctx = ailens360.WithTrace(ctx, ailens360.TraceConfig{
 		ID:        traceID,
 		Name:      "weather_demo_turn",
-		UserID:    "user_alice_42",
+		UserID:    userID,
 		SessionID: sessionID,
 		Tag:       "demo,react-agent",
 	})
 
-	log.Printf("user_id    = user_alice_42")
+	log.Printf("user_id    = %s", userID)
 	log.Printf("session_id = %s", sessionID)
 	log.Printf("trace_id   = %s", traceID)
 
 	// 5) Run the agent and stream the final answer.
-	runner := adk.NewRunner(ctx, adk.RunnerConfig{Agent: ag, EnableStreaming: true})
-	iter := runner.Run(ctx, []*schema.Message{
-		schema.UserMessage("上海现在天气怎么样？请用中文回答。"),
-	})
+	runner := adk.NewTypedRunner(adk.TypedRunnerConfig[*schema.AgenticMessage]{Agent: ag, EnableStreaming: true})
+	userMsg := schema.UserAgenticMessage("上海现在天气怎么样？请用中文回答。")
+	iter := runner.Run(ctx, []*schema.AgenticMessage{
+		userMsg,
+	}, adk.WithChatModelOptions([]model.Option{
+		agenticopenai.WithExtraFields(map[string]any{
+			"user_id": userID,
+		}),
+	}))
 
 	fmt.Println("\n--- streaming answer ---")
 	for {
@@ -170,8 +182,8 @@ func main() {
 		if err != nil || msg == nil {
 			continue
 		}
-		if msg.Content != "" {
-			fmt.Print(msg.Content)
+		if text := agmsg.Text(msg); text != "" {
+			fmt.Print(text)
 		}
 	}
 	fmt.Println()

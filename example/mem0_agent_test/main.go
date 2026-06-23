@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/CoolBanHub/aggo/agent"
+	agmsg "github.com/CoolBanHub/aggo/internal/agentic"
 	"github.com/CoolBanHub/aggo/memory"
 	"github.com/CoolBanHub/aggo/memory/mem0"
 	"github.com/CoolBanHub/aggo/model"
@@ -64,7 +65,7 @@ func main() {
 		log.Fatalf("创建 Agent 失败: %v", err)
 	}
 
-	runner := adk.NewRunner(ctx, adk.RunnerConfig{Agent: ag})
+	runner := adk.NewTypedRunner(adk.TypedRunnerConfig[*schema.AgenticMessage]{Agent: ag})
 
 	userID := envOrDefault("MEM0_DEMO_USER_ID", fmt.Sprintf("mem0-demo-user-%d", time.Now().UnixNano()))
 	sessionID := envOrDefault("MEM0_DEMO_SESSION_ID", fmt.Sprintf("mem0-demo-session-%d", time.Now().UnixNano()))
@@ -77,8 +78,8 @@ func main() {
 
 	for i, input := range conversations {
 		log.Printf("User: %s", input)
-		iter := runner.Run(ctx, []*schema.Message{
-			schema.UserMessage(input),
+		iter := runner.Run(ctx, []*schema.AgenticMessage{
+			schema.UserAgenticMessage(input),
 		}, adk.WithSessionValues(map[string]any{
 			"userID":    userID,
 			"sessionID": sessionID,
@@ -95,7 +96,7 @@ func main() {
 			}
 			if event.Output != nil && event.Output.MessageOutput != nil {
 				if msg, err := event.Output.MessageOutput.GetMessage(); err == nil && msg != nil {
-					response = msg.Content
+					response = agmsg.Text(msg)
 				}
 			}
 		}
@@ -156,8 +157,8 @@ func waitForMemory(ctx context.Context, provider memory.MemoryProvider, userID, 
 		result, err := provider.Retrieve(ctx, &memory.RetrieveRequest{
 			UserID:    userID,
 			SessionID: sessionID,
-			Messages: []*schema.Message{
-				schema.UserMessage(nextQuestion),
+			Messages: []*schema.AgenticMessage{
+				schema.UserAgenticMessage(nextQuestion),
 			},
 		})
 		if err == nil && containsExpectedMemory(result, expected...) {
@@ -170,22 +171,22 @@ func waitForMemory(ctx context.Context, provider memory.MemoryProvider, userID, 
 	return context.DeadlineExceeded
 }
 
-func systemMessageContents(result *memory.RetrieveResult) []string {
-	if result == nil || len(result.SystemMessages) == 0 {
+func contextMessageContents(result *memory.RetrieveResult) []string {
+	if result == nil || len(result.ContextMessages) == 0 {
 		return nil
 	}
-	out := make([]string, 0, len(result.SystemMessages))
-	for _, msg := range result.SystemMessages {
+	out := make([]string, 0, len(result.ContextMessages))
+	for _, msg := range result.ContextMessages {
 		if msg == nil {
 			continue
 		}
-		out = append(out, msg.Content)
+		out = append(out, agmsg.Text(msg))
 	}
 	return out
 }
 
 func containsExpectedMemory(result *memory.RetrieveResult, expected ...string) bool {
-	contents := strings.Join(systemMessageContents(result), "\n")
+	contents := strings.Join(contextMessageContents(result), "\n")
 	if strings.TrimSpace(contents) == "" {
 		return false
 	}

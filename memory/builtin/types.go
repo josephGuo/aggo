@@ -21,18 +21,21 @@ func ptrTo[T any](v T) *T {
 	return &v
 }
 
-// ToSchemaMessage 将 ConversationMessage 转换为 schema.Message
+// ToAgenticMessage 将 ConversationMessage 转换为 schema.AgenticMessage
 // 统一转换逻辑，避免在多处重复实现
-func (m *ConversationMessage) ToSchemaMessage() *schema.Message {
-	msg := &schema.Message{
-		Role: schema.RoleType(m.Role),
+func (m *ConversationMessage) ToAgenticMessage() *schema.AgenticMessage {
+	msg := &schema.AgenticMessage{
+		Role: schema.AgenticRoleType(m.Role),
 	}
-	msg.Content = m.Content
 	if len(m.Parts) > 0 {
-		multiContent := make([]schema.MessageInputPart, len(m.Parts))
-		copy(multiContent, m.Parts)
-		msg.UserInputMultiContent = multiContent
-		msg.Content = ""
+		msg.ContentBlocks = messageInputPartsToContentBlocks(m.Parts)
+	} else if m.Content != "" {
+		switch msg.Role {
+		case schema.AgenticRoleTypeAssistant:
+			msg.ContentBlocks = []*schema.ContentBlock{schema.NewContentBlock(&schema.AssistantGenText{Text: m.Content})}
+		default:
+			msg.ContentBlocks = []*schema.ContentBlock{schema.NewContentBlock(&schema.UserInputText{Text: m.Content})}
+		}
 	}
 	msg.Extra = map[string]any{
 		MessageExtraIDKey:        m.ID,
@@ -44,6 +47,62 @@ func (m *ConversationMessage) ToSchemaMessage() *schema.Message {
 		msg.Extra[MessageExtraCreatedAtKey] = m.CreatedAt.Format(time.RFC3339)
 	}
 	return msg
+}
+
+func messageInputPartsToContentBlocks(parts []schema.MessageInputPart) []*schema.ContentBlock {
+	blocks := make([]*schema.ContentBlock, 0, len(parts))
+	for _, part := range parts {
+		switch part.Type {
+		case schema.ChatMessagePartTypeText:
+			blocks = append(blocks, schema.NewContentBlock(&schema.UserInputText{Text: part.Text}))
+		case schema.ChatMessagePartTypeImageURL:
+			if part.Image != nil {
+				blocks = append(blocks, schema.NewContentBlock(&schema.UserInputImage{
+					URL:        valueOrEmpty(part.Image.URL),
+					Base64Data: valueOrEmpty(part.Image.Base64Data),
+					MIMEType:   part.Image.MIMEType,
+					Detail:     part.Image.Detail,
+				}))
+			}
+		case schema.ChatMessagePartTypeAudioURL:
+			if part.Audio != nil {
+				blocks = append(blocks, schema.NewContentBlock(&schema.UserInputAudio{
+					URL:        valueOrEmpty(part.Audio.URL),
+					Base64Data: valueOrEmpty(part.Audio.Base64Data),
+					MIMEType:   part.Audio.MIMEType,
+				}))
+			}
+		case schema.ChatMessagePartTypeVideoURL:
+			if part.Video != nil {
+				blocks = append(blocks, schema.NewContentBlock(&schema.UserInputVideo{
+					URL:        valueOrEmpty(part.Video.URL),
+					Base64Data: valueOrEmpty(part.Video.Base64Data),
+					MIMEType:   part.Video.MIMEType,
+				}))
+			}
+		case schema.ChatMessagePartTypeFileURL:
+			if part.File != nil {
+				blocks = append(blocks, schema.NewContentBlock(&schema.UserInputFile{
+					URL:        valueOrEmpty(part.File.URL),
+					Name:       part.File.Name,
+					Base64Data: valueOrEmpty(part.File.Base64Data),
+					MIMEType:   part.File.MIMEType,
+				}))
+			}
+		default:
+			if part.Text != "" {
+				blocks = append(blocks, schema.NewContentBlock(&schema.UserInputText{Text: part.Text}))
+			}
+		}
+	}
+	return blocks
+}
+
+func valueOrEmpty(v *string) string {
+	if v == nil {
+		return ""
+	}
+	return *v
 }
 
 // UserMemory 用户记忆结构
@@ -135,7 +194,7 @@ type MemoryConfig struct {
 	//   true  - 用户记忆拆为“常驻短文档（核心约定+基础信息）”和“事件检索表”，
 	//           Retrieve 仅注入短文档 + 最近 RecentEventLimit 条事件；
 	//           更早的事件需通过 search_user_memory 工具按关键词/时间检索。
-	//   false - 兼容旧行为，整篇 UserMemory.Memory 全量注入 system。
+	//   false - 兼容旧行为，整篇 UserMemory.Memory 全量注入模型上下文。
 	// 仅当 EnableUserMemories=true 时生效。
 	EnableEventSearch bool `json:"enableEventSearch"`
 	// 常驻注入的最近事件条数，默认 20，仅在 EnableEventSearch=true 时生效。

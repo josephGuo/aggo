@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	agmsg "github.com/CoolBanHub/aggo/internal/agentic"
 	"github.com/cloudwego/eino/schema"
 )
 
@@ -90,16 +91,16 @@ type ProviderConfig struct {
 // BuildRetrieveRequest constructs a RetrieveRequest from a list of messages.
 // It filters to only user/assistant messages, trims whitespace, and limits
 // to the most recent `limit` messages.
-func BuildRetrieveRequest(messages []*schema.Message, userID string, limit int) RetrieveRequest {
-	filtered := make([]*schema.Message, 0, len(messages))
+func BuildRetrieveRequest(messages []*schema.AgenticMessage, userID string, limit int) RetrieveRequest {
+	filtered := make([]*schema.AgenticMessage, 0, len(messages))
 	for _, msg := range messages {
 		if msg == nil {
 			continue
 		}
-		if msg.Role != schema.User && msg.Role != schema.Assistant {
+		if msg.Role != schema.AgenticRoleTypeUser && msg.Role != schema.AgenticRoleTypeAssistant {
 			continue
 		}
-		if strings.TrimSpace(msg.Content) == "" {
+		if strings.TrimSpace(agmsg.Text(msg)) == "" {
 			continue
 		}
 		filtered = append(filtered, msg)
@@ -120,7 +121,7 @@ func BuildRetrieveRequest(messages []*schema.Message, userID string, limit int) 
 		req.Queries = append(req.Queries, Query{
 			Role: string(msg.Role),
 			Content: QueryContent{
-				Text: strings.TrimSpace(msg.Content),
+				Text: strings.TrimSpace(agmsg.Text(msg)),
 			},
 		})
 	}
@@ -136,8 +137,7 @@ func BuildConversationTurn(userText, assistantText string) string {
 }
 
 // FormatMemoryContext formats a RetrieveResponse into a human-readable string
-// suitable for injection as a system message. It limits output to maxItems per
-// category.
+// suitable for injection as dynamic context. It limits output to maxItems per category.
 func FormatMemoryContext(resp RetrieveResponse, maxItems int) string {
 	hasMemory := len(resp.Categories) > 0 || len(resp.Items) > 0 || len(resp.Resources) > 0
 	if !hasMemory {
